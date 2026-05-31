@@ -14,17 +14,17 @@ use memmap2::Mmap;
 
 use crate::dataset::{LoadedDataset, ReferenceLabel, VECTOR_DIMENSIONS};
 
-pub const NLIST: usize = 8192;
-pub const NPROBE: usize = 3;
+pub const NLIST: usize = 16384;
+pub const NPROBE: usize = 2;
 const KMEANS_ITERS: usize = 5;
 pub const DIMS_PADDED: usize = 16;
 
 /// Number of coarse clusters (level 1)
 const COARSE_CLUSTERS: usize = 64;
 /// How many coarse clusters to probe at level 1
-const COARSE_PROBE: usize = 4;
+const COARSE_PROBE: usize = 8;
 /// Centroids per coarse cluster (NLIST / COARSE_CLUSTERS)
-const FINE_PER_COARSE: usize = NLIST / COARSE_CLUSTERS; // 128
+const FINE_PER_COARSE: usize = NLIST / COARSE_CLUSTERS; // 256
 
 pub const CENTROIDS_FILE: &str = "ivf-centroids.bin";
 pub const VECTORS_FILE: &str = "ivf-vectors.bin";
@@ -141,23 +141,24 @@ impl IvfIndex {
     }
 
     fn closest_cells(&self, query: &[i16; DIMS_PADDED]) -> [u16; NPROBE] {
-        // Level 1: find top COARSE_PROBE coarse clusters (64 comparisons)
+        // Level 1: find top COARSE_PROBE coarse clusters (128 comparisons)
         let q32: [i32; DIMS_PADDED] = {
             let mut out = [0i32; DIMS_PADDED];
             for i in 0..DIMS_PADDED { out[i] = query[i] as i32; }
             out
         };
 
-        let mut coarse_best = [(i64::MAX, 0u16); COARSE_PROBE];
+        let mut coarse_best = [(i64::MAX, 0u8); COARSE_PROBE];
+
         for g in 0..COARSE_CLUSTERS {
-            let c = &self.coarse[g];
+            let c = unsafe { self.coarse.get_unchecked(g) };
             let mut dist = 0i64;
             for d in 0..DIMS_PADDED {
                 let diff = (q32[d] - c[d]) as i64;
                 dist += diff * diff;
             }
             if dist < coarse_best[COARSE_PROBE - 1].0 {
-                coarse_best[COARSE_PROBE - 1] = (dist, g as u16);
+                coarse_best[COARSE_PROBE - 1] = (dist, g as u8);
                 let mut j = COARSE_PROBE - 1;
                 while j > 0 && coarse_best[j].0 < coarse_best[j - 1].0 {
                     coarse_best.swap(j, j - 1);
@@ -166,10 +167,11 @@ impl IvfIndex {
             }
         }
 
-        // Level 2: search fine centroids only within top coarse clusters
-        // COARSE_PROBE * FINE_PER_COARSE = 4 * 128 = 512 comparisons (vs 8192 before)
+        // Level 2: search fine centroids in top COARSE_PROBE clusters
+        // 5 * 64 = 320 fine centroid comparisons
         let centroids = self.centroids_slice();
-        let mut best = [(i64::MAX, 0u16); NPROBE];
+        let mut best0 = (i64::MAX, 0u16);
+        let mut best1 = (i64::MAX, 0u16);
 
         for ci in 0..COARSE_PROBE {
             let group = coarse_best[ci].1 as usize;
@@ -180,18 +182,18 @@ impl IvfIndex {
                 let c = unsafe { centroids.get_unchecked(offset..offset + DIMS_PADDED) };
                 let dist = l2_16dims(query, c);
 
-                if dist < best[NPROBE - 1].0 {
-                    best[NPROBE - 1] = (dist, idx as u16);
-                    let mut j = NPROBE - 1;
-                    while j > 0 && best[j].0 < best[j - 1].0 {
-                        best.swap(j, j - 1);
-                        j -= 1;
+                if dist < best1.0 {
+                    if dist < best0.0 {
+                        best1 = best0;
+                        best0 = (dist, idx as u16);
+                    } else {
+                        best1 = (dist, idx as u16);
                     }
                 }
             }
         }
 
-        [best[0].1, best[1].1, best[2].1]
+        [best0.1, best1.1]
     }
 
     fn centroids_slice(&self) -> &[i16] {

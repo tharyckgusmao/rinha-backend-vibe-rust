@@ -113,6 +113,10 @@ fn linux_main() {
             let ret = libc::listen(fd, 8192);
             assert!(ret == 0, "[lb] listen failed");
 
+            // TCP_DEFER_ACCEPT: kernel only wakes us when data arrives, not on SYN
+            let defer: i32 = 1;
+            libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, &defer as *const _ as *const libc::c_void, 4);
+
             fd
         }
     }

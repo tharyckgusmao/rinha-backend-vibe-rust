@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/tharyckgusmao/rinha-backend-vibe:latest
+    image: ghcr.io/tharyckgusmao/rinha-backend-vibe-rust:latest
     command: ["/app/lb"]
     ports:
       - "9999:9999"
@@ -16,11 +16,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
-          memory: "32MB"
+          cpus: "0.03"
+          memory: "10MB"
 
   api-1:
-    image: ghcr.io/tharyckgusmao/rinha-backend-vibe:latest
+    image: ghcr.io/tharyckgusmao/rinha-backend-vibe-rust:latest
     command: ["/app/rinha"]
     environment:
       PORT: "9999"
@@ -35,11 +35,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "159MB"
+          cpus: "0.485"
+          memory: "170MB"
 
   api-2:
-    image: ghcr.io/tharyckgusmao/rinha-backend-vibe:latest
+    image: ghcr.io/tharyckgusmao/rinha-backend-vibe-rust:latest
     command: ["/app/rinha"]
     environment:
       PORT: "9999"
@@ -54,8 +54,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "159MB"
+          cpus: "0.485"
+          memory: "170MB"
 
 volumes:
   sockets:

@@ -46,7 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(client_fd) => {
                     let stream = unsafe { TcpStream::from_raw_fd(client_fd) };
                     let st = Arc::clone(&state);
-                    thread::spawn(move || { let _ = serve_connection(stream, &st); });
+                    thread::Builder::new()
+                        .stack_size(64 * 1024)
+                        .spawn(move || { let _ = serve_connection(stream, &st); })
+                        .ok();
                 }
                 Err(_) => continue,
             }
@@ -59,7 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for stream in listener.incoming() {
             let stream = stream?;
             let st = Arc::clone(&state);
-            thread::spawn(move || { let _ = serve_connection(stream, &st); });
+            thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn(move || { let _ = serve_connection(stream, &st); })
+                .ok();
         }
     }
 
@@ -95,7 +101,7 @@ const MAX_BUF: usize = 2048;
 
 fn serve_connection(mut stream: TcpStream, state: &State) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut buf = [0u8; MAX_BUF];
     let mut filled = 0;
 
