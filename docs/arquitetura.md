@@ -307,15 +307,6 @@ c=10:  p99 < 1ms,  49,800 req/s
 c=50:  p99 = 2ms,  53,527 req/s
 ```
 
-### Comparação com ranking
-
-| Posição | Participante | p99 | Score |
-|---------|-------------|-----|-------|
-| 1 | rafaelcoelhox | 0.36ms | 6000 |
-| 3 | fksegundo-rust | 0.39ms | 6000 |
-| 7 | vinicius-piassa-go | 0.44ms | 6000 |
-| **Nós** | **tharyckgusmao** | **<1ms** | **~5500-6000** |
-
 ---
 
 ## Referências
