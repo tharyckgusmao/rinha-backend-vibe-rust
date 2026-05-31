@@ -53,6 +53,13 @@ impl IvfIndex {
         let vectors = unsafe { Mmap::map(&vectors_file)? };
         let labels = unsafe { Mmap::map(&labels_file)? };
 
+        // Hint kernel to prefetch sequentially
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(vectors.as_ptr() as *mut libc::c_void, vectors.len(), libc::MADV_SEQUENTIAL);
+            libc::madvise(centroids.as_ptr() as *mut libc::c_void, centroids.len(), libc::MADV_WILLNEED);
+        }
+
         let offsets_raw = fs::read(dir.join(OFFSETS_FILE))?;
         let offsets: Vec<u32> = offsets_raw
             .chunks_exact(4)
@@ -353,27 +360,57 @@ pub fn build_ivf(dataset: &LoadedDataset, output_dir: &Path) -> io::Result<()> {
 
 #[inline(always)]
 fn l2_16dims(a: &[i16], b: &[i16]) -> i64 {
-    let d0 = a[0] as i32 - b[0] as i32;
-    let d1 = a[1] as i32 - b[1] as i32;
-    let d2 = a[2] as i32 - b[2] as i32;
-    let d3 = a[3] as i32 - b[3] as i32;
-    let d4 = a[4] as i32 - b[4] as i32;
-    let d5 = a[5] as i32 - b[5] as i32;
-    let d6 = a[6] as i32 - b[6] as i32;
-    let d7 = a[7] as i32 - b[7] as i32;
-    let acc0 = (d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 + d7*d7) as i64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        unsafe {
+            // Load 8 i16s at a time
+            let a0 = _mm_loadu_si128(a.as_ptr() as *const __m128i);
+            let b0 = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+            let a1 = _mm_loadu_si128(a.as_ptr().add(8) as *const __m128i);
+            let b1 = _mm_loadu_si128(b.as_ptr().add(8) as *const __m128i);
 
-    let d8 = a[8] as i32 - b[8] as i32;
-    let d9 = a[9] as i32 - b[9] as i32;
-    let d10 = a[10] as i32 - b[10] as i32;
-    let d11 = a[11] as i32 - b[11] as i32;
-    let d12 = a[12] as i32 - b[12] as i32;
-    let d13 = a[13] as i32 - b[13] as i32;
-    let d14 = a[14] as i32 - b[14] as i32;
-    let d15 = a[15] as i32 - b[15] as i32;
-    let acc1 = (d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13 + d14*d14 + d15*d15) as i64;
+            // diff = a - b (i16)
+            let d0 = _mm_sub_epi16(a0, b0);
+            let d1 = _mm_sub_epi16(a1, b1);
 
-    acc0 + acc1
+            // madd: multiply adjacent pairs and add → i32
+            // madd(d, d) = d[0]*d[0]+d[1]*d[1], d[2]*d[2]+d[3]*d[3], ...
+            let sq0 = _mm_madd_epi16(d0, d0);
+            let sq1 = _mm_madd_epi16(d1, d1);
+
+            // Sum all i32 lanes
+            let sum = _mm_add_epi32(sq0, sq1);
+            // Horizontal sum of 4 i32s
+            let hi = _mm_srli_si128(sum, 8);
+            let sum2 = _mm_add_epi32(sum, hi);
+            let hi2 = _mm_srli_si128(sum2, 4);
+            let sum3 = _mm_add_epi32(sum2, hi2);
+            _mm_cvtsi128_si32(sum3) as i64
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let d0 = a[0] as i32 - b[0] as i32;
+        let d1 = a[1] as i32 - b[1] as i32;
+        let d2 = a[2] as i32 - b[2] as i32;
+        let d3 = a[3] as i32 - b[3] as i32;
+        let d4 = a[4] as i32 - b[4] as i32;
+        let d5 = a[5] as i32 - b[5] as i32;
+        let d6 = a[6] as i32 - b[6] as i32;
+        let d7 = a[7] as i32 - b[7] as i32;
+        let acc0 = (d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 + d7*d7) as i64;
+        let d8 = a[8] as i32 - b[8] as i32;
+        let d9 = a[9] as i32 - b[9] as i32;
+        let d10 = a[10] as i32 - b[10] as i32;
+        let d11 = a[11] as i32 - b[11] as i32;
+        let d12 = a[12] as i32 - b[12] as i32;
+        let d13 = a[13] as i32 - b[13] as i32;
+        let d14 = a[14] as i32 - b[14] as i32;
+        let d15 = a[15] as i32 - b[15] as i32;
+        let acc1 = (d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13 + d14*d14 + d15*d15) as i64;
+        acc0 + acc1
+    }
 }
 
 struct _Unused; // keep file valid

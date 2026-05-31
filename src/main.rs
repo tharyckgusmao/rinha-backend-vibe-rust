@@ -141,7 +141,11 @@ fn serve_connection(mut stream: TcpStream, state: &State) -> std::io::Result<()>
                 let body = &buf[body_start..request_end];
                 let response = match state.vectorizer.vectorize_json_bytes(body) {
                     Ok(query) => {
-                        let quantized = crate::dataset::quantize_query(&query);
+                        // Inline quantize - avoid separate pass
+                        let mut quantized = [0i16; 14];
+                        for i in 0..14 {
+                            quantized[i] = (query[i] * 10000.0).round().clamp(-32768.0, 32767.0) as i16;
+                        }
                         let votes = state.ivf.fraud_votes(&quantized);
                         fraud_response(votes)
                     }
