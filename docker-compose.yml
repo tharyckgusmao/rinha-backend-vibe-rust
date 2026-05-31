@@ -1,0 +1,61 @@
+services:
+  lb:
+    image: ghcr.io/tharyckgusmao/rinha-backend-vibe-rust:latest
+    command: ["/app/lb"]
+    ports:
+      - "9999:9999"
+    environment:
+      UPSTREAMS: "/sockets/api1.sock,/sockets/api2.sock"
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "32MB"
+
+  api-1:
+    image: ghcr.io/tharyckgusmao/rinha-backend-vibe-rust:latest
+    command: ["/app/rinha"]
+    environment:
+      PORT: "9999"
+      FD_SOCKET_PATH: "/sockets/api1.sock"
+    volumes:
+      - sockets:/sockets
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /sockets/api1.sock"]
+      interval: 1s
+      timeout: 1s
+      retries: 60
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "159MB"
+
+  api-2:
+    image: ghcr.io/tharyckgusmao/rinha-backend-vibe-rust:latest
+    command: ["/app/rinha"]
+    environment:
+      PORT: "9999"
+      FD_SOCKET_PATH: "/sockets/api2.sock"
+    volumes:
+      - sockets:/sockets
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /sockets/api2.sock"]
+      interval: 1s
+      timeout: 1s
+      retries: 60
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "159MB"
+
+volumes:
+  sockets:
