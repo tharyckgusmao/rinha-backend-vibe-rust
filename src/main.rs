@@ -96,11 +96,10 @@ const MAX_BUF: usize = 2048;
 fn serve_connection(mut stream: TcpStream, state: &State) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-    let mut buf = vec![0u8; MAX_BUF];
+    let mut buf = [0u8; MAX_BUF];
     let mut filled = 0;
 
     loop {
-        // Read until we have full headers
         let (method, content_length, header_end) = loop {
             if filled >= MAX_BUF {
                 return Ok(());
@@ -119,7 +118,6 @@ fn serve_connection(mut stream: TcpStream, state: &State) -> std::io::Result<()>
         let body_start = header_end + 4;
         let request_end = body_start + content_length;
 
-        // Read remaining body if needed
         while filled < request_end {
             if request_end > MAX_BUF {
                 return Ok(());
@@ -131,7 +129,6 @@ fn serve_connection(mut stream: TcpStream, state: &State) -> std::io::Result<()>
             filled += n;
         }
 
-        // Route and respond
         match method {
             Method::GetReady => {
                 if state.ivf.is_ready() {
@@ -158,7 +155,6 @@ fn serve_connection(mut stream: TcpStream, state: &State) -> std::io::Result<()>
             }
         }
 
-        // Shift remaining data
         if filled > request_end {
             buf.copy_within(request_end..filled, 0);
             filled -= request_end;
@@ -175,8 +171,6 @@ enum Method {
     Unknown,
 }
 
-/// Parse request line + headers. Returns (method, content_length, header_end_pos).
-/// header_end_pos is the position of the first byte of \r\n\r\n.
 fn parse_request_head(buf: &[u8]) -> Option<(Method, usize, usize)> {
     let header_end = find_header_end(buf)?;
     let method = if buf.starts_with(b"GET /ready") {
@@ -192,11 +186,25 @@ fn parse_request_head(buf: &[u8]) -> Option<(Method, usize, usize)> {
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+    memchr_find(buf)
+}
+
+/// Fast \r\n\r\n search using manual scan with early byte check
+#[inline(always)]
+fn memchr_find(buf: &[u8]) -> Option<usize> {
+    let len = buf.len();
+    if len < 4 { return None; }
+    let mut i = 0;
+    while i + 3 < len {
+        if buf[i] == b'\r' && buf[i+1] == b'\n' && buf[i+2] == b'\r' && buf[i+3] == b'\n' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn content_length_from_headers(headers: &[u8]) -> usize {
-    // Case-insensitive scan for content-length header
     let len = headers.len();
     let needle = b"content-length:";
     let nlen = needle.len();

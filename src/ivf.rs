@@ -14,7 +14,7 @@ use memmap2::Mmap;
 
 use crate::dataset::{LoadedDataset, ReferenceLabel, VECTOR_DIMENSIONS};
 
-pub const NLIST: usize = 4096;
+pub const NLIST: usize = 8192;
 pub const NPROBE: usize = 3;
 const KMEANS_ITERS: usize = 5;
 pub const DIMS_PADDED: usize = 16;
@@ -66,7 +66,9 @@ impl IvfIndex {
 
         let probes = self.closest_cells(&q);
 
-        let mut top = TopK::new();
+        let mut top_dists = [i64::MAX; 5];
+        let mut top_idx = [0u32; 5];
+        let mut top_len = 0usize;
         let vectors = self.vectors_slice();
 
         for cell_idx in probes {
@@ -74,46 +76,70 @@ impl IvfIndex {
             let end = self.offsets[cell_idx as usize + 1] as usize;
             for i in start..end {
                 let offset = i * DIMS_PADDED;
-                let v = &vectors[offset..offset + DIMS_PADDED];
+                let v = unsafe { vectors.get_unchecked(offset..offset + DIMS_PADDED) };
                 let dist = l2_16dims(&q, v);
-                top.push(dist, i as u32);
-            }
-        }
 
-        let labels = self.labels_slice();
-        let mut fraud = 0;
-        for i in 0..top.len {
-            if labels[top.indices[i] as usize] == 1 {
-                fraud += 1;
-            }
-        }
-        fraud
-    }
-
-    fn closest_cells(&self, query: &[i16; DIMS_PADDED]) -> [u16; NPROBE] {
-        let centroids = self.centroids_slice();
-        let mut best = [(i64::MAX, 0u16); NPROBE];
-
-        for idx in 0..NLIST {
-            let offset = idx * DIMS_PADDED;
-            let c = &centroids[offset..offset + DIMS_PADDED];
-            let dist = l2_16dims(query, c);
-
-            if dist < best[NPROBE - 1].0 {
-                best[NPROBE - 1] = (dist, idx as u16);
-                let mut j = NPROBE - 1;
-                while j > 0 && best[j].0 < best[j - 1].0 {
-                    best.swap(j, j - 1);
-                    j -= 1;
+                if top_len < 5 {
+                    top_dists[top_len] = dist;
+                    top_idx[top_len] = i as u32;
+                    top_len += 1;
+                    if top_len == 5 {
+                        sort5(&mut top_dists, &mut top_idx);
+                    }
+                } else if dist < top_dists[4] {
+                    top_dists[4] = dist;
+                    top_idx[4] = i as u32;
+                    sort5(&mut top_dists, &mut top_idx);
                 }
             }
         }
 
-        let mut result = [0u16; NPROBE];
-        for i in 0..NPROBE {
-            result[i] = best[i].1;
+        // Count fraud labels — direct access to mmap'd labels
+        let labels = self.labels_slice();
+        let mut fraud = 0u32;
+        for i in 0..top_len {
+            fraud += unsafe { *labels.get_unchecked(top_idx[i] as usize) } as u32;
         }
-        result
+        fraud as usize
+    }
+
+    fn closest_cells(&self, query: &[i16; DIMS_PADDED]) -> [u16; NPROBE] {
+        let centroids = self.centroids_slice();
+        let mut best0_dist = i64::MAX;
+        let mut best0_idx = 0u16;
+        let mut best1_dist = i64::MAX;
+        let mut best1_idx = 0u16;
+        let mut best2_dist = i64::MAX;
+        let mut best2_idx = 0u16;
+
+        let mut idx = 0;
+        while idx < NLIST {
+            let offset = idx * DIMS_PADDED;
+            let c = unsafe { centroids.get_unchecked(offset..offset + DIMS_PADDED) };
+            let dist = l2_16dims(query, c);
+
+            if dist < best2_dist {
+                if dist < best0_dist {
+                    best2_dist = best1_dist;
+                    best2_idx = best1_idx;
+                    best1_dist = best0_dist;
+                    best1_idx = best0_idx;
+                    best0_dist = dist;
+                    best0_idx = idx as u16;
+                } else if dist < best1_dist {
+                    best2_dist = best1_dist;
+                    best2_idx = best1_idx;
+                    best1_dist = dist;
+                    best1_idx = idx as u16;
+                } else {
+                    best2_dist = dist;
+                    best2_idx = idx as u16;
+                }
+            }
+            idx += 1;
+        }
+
+        [best0_idx, best1_idx, best2_idx]
     }
 
     fn centroids_slice(&self) -> &[i16] {
@@ -139,6 +165,19 @@ impl IvfIndex {
     }
 }
 
+/// Sort 5 elements (insertion sort, optimal for tiny arrays)
+#[inline(always)]
+fn sort5(dists: &mut [i64; 5], indices: &mut [u32; 5]) {
+    for i in 1..5 {
+        let mut j = i;
+        while j > 0 && dists[j] < dists[j - 1] {
+            dists.swap(j, j - 1);
+            indices.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+}
+
 /// Offline IVF build — called by build-dataset binary.
 pub fn build_ivf(dataset: &LoadedDataset, output_dir: &Path) -> io::Result<()> {
     let n = dataset.total_vectors();
@@ -157,23 +196,35 @@ pub fn build_ivf(dataset: &LoadedDataset, output_dir: &Path) -> io::Result<()> {
     // K-means
     let mut assignments = vec![0u16; n];
     for iter in 0..KMEANS_ITERS {
-        for i in 0..n {
-            let v = dataset.vector_at(i);
-            let mut best_dist = i64::MAX;
-            let mut best = 0u16;
-            for (ci, c) in centroids.iter().enumerate() {
-                let mut d = 0i64;
-                for dim in 0..VECTOR_DIMENSIONS {
-                    let diff = v[dim] as i64 - c[dim] as i64;
-                    d += diff * diff;
-                }
-                if d < best_dist {
-                    best_dist = d;
-                    best = ci as u16;
-                }
+        // Parallel assignment using chunks
+        let chunk_size = n / 8;
+        std::thread::scope(|s| {
+            for (chunk_idx, chunk) in assignments.chunks_mut(chunk_size).enumerate() {
+                let centroids = &centroids;
+                let dataset = &dataset;
+                let base = chunk_idx * chunk_size;
+                s.spawn(move || {
+                    for (local_i, assignment) in chunk.iter_mut().enumerate() {
+                        let i = base + local_i;
+                        let v = dataset.vector_at(i);
+                        let mut best_dist = i64::MAX;
+                        let mut best = 0u16;
+                        for (ci, c) in centroids.iter().enumerate() {
+                            let mut d = 0i64;
+                            for dim in 0..VECTOR_DIMENSIONS {
+                                let diff = v[dim] as i64 - c[dim] as i64;
+                                d += diff * diff;
+                            }
+                            if d < best_dist {
+                                best_dist = d;
+                                best = ci as u16;
+                            }
+                        }
+                        *assignment = best;
+                    }
+                });
             }
-            assignments[i] = best;
-        }
+        });
 
         let mut sums = vec![[0i64; VECTOR_DIMENSIONS]; NLIST];
         let mut counts = vec![0u32; NLIST];
@@ -280,40 +331,4 @@ fn l2_16dims(a: &[i16], b: &[i16]) -> i64 {
     acc0 + acc1
 }
 
-struct TopK {
-    dists: [i64; 5],
-    indices: [u32; 5],
-    len: usize,
-}
-
-impl TopK {
-    fn new() -> Self {
-        Self { dists: [i64::MAX; 5], indices: [0; 5], len: 0 }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, dist: i64, idx: u32) {
-        if self.len < 5 {
-            self.dists[self.len] = dist;
-            self.indices[self.len] = idx;
-            self.len += 1;
-            if self.len == 5 { self.sort(); }
-        } else if dist < self.dists[4] {
-            self.dists[4] = dist;
-            self.indices[4] = idx;
-            self.sort();
-        }
-    }
-
-    #[inline(always)]
-    fn sort(&mut self) {
-        for i in 1..self.len {
-            let mut j = i;
-            while j > 0 && self.dists[j] < self.dists[j - 1] {
-                self.dists.swap(j, j - 1);
-                self.indices.swap(j, j - 1);
-                j -= 1;
-            }
-        }
-    }
-}
+struct _Unused; // keep file valid
