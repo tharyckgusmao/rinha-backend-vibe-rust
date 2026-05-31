@@ -183,14 +183,29 @@ fn merchant_is_known(request: &FraudRequest) -> bool {
 }
 
 fn find_key(body: &[u8], key: &[u8]) -> Option<usize> {
-    body.windows(key.len()).position(|window| window == key)
+    let first = key[0];
+    let klen = key.len();
+    let mut i = 0;
+    while i + klen <= body.len() {
+        if body[i] == first && body[i..i + klen] == *key {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn find_key_from(body: &[u8], from: usize, key: &[u8]) -> Option<usize> {
-    body.get(from..)?
-        .windows(key.len())
-        .position(|window| window == key)
-        .map(|idx| from + idx)
+    let first = key[0];
+    let klen = key.len();
+    let mut i = from;
+    while i + klen <= body.len() {
+        if body[i] == first && body[i..i + klen] == *key {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn value_start(body: &[u8], key_pos: usize) -> Result<usize, VectorizeError> {
@@ -211,14 +226,34 @@ fn value_start(body: &[u8], key_pos: usize) -> Result<usize, VectorizeError> {
 fn number_after(body: &[u8], from: usize, key: &[u8]) -> Result<f32, VectorizeError> {
     let key_pos = find_key_from(body, from, key).ok_or(VectorizeError::InvalidJson)?;
     let start = value_start(body, key_pos)?;
-    let mut end = start;
-    while matches!(body.get(end), Some(b'0'..=b'9' | b'-' | b'.')) {
-        end += 1;
+    parse_f32_fast(&body[start..])
+}
+
+/// Fast inline f32 parser — avoids str conversion and generic parse
+#[inline(always)]
+fn parse_f32_fast(buf: &[u8]) -> Result<f32, VectorizeError> {
+    let mut i = 0;
+    let neg = if buf.get(i) == Some(&b'-') { i += 1; true } else { false };
+
+    let mut int_part = 0i64;
+    while i < buf.len() && buf[i].is_ascii_digit() {
+        int_part = int_part * 10 + (buf[i] - b'0') as i64;
+        i += 1;
     }
-    std::str::from_utf8(&body[start..end])
-        .map_err(|_| VectorizeError::InvalidJson)?
-        .parse::<f32>()
-        .map_err(|_| VectorizeError::InvalidJson)
+
+    let mut frac = 0i64;
+    let mut frac_div = 1i64;
+    if i < buf.len() && buf[i] == b'.' {
+        i += 1;
+        while i < buf.len() && buf[i].is_ascii_digit() {
+            frac = frac * 10 + (buf[i] - b'0') as i64;
+            frac_div *= 10;
+            i += 1;
+        }
+    }
+
+    let val = int_part as f32 + frac as f32 / frac_div as f32;
+    Ok(if neg { -val } else { val })
 }
 
 fn bool_after(body: &[u8], from: usize, key: &[u8]) -> Result<bool, VectorizeError> {

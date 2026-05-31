@@ -19,6 +19,13 @@ pub const NPROBE: usize = 3;
 const KMEANS_ITERS: usize = 5;
 pub const DIMS_PADDED: usize = 16;
 
+/// Number of coarse clusters (level 1)
+const COARSE_CLUSTERS: usize = 64;
+/// How many coarse clusters to probe at level 1
+const COARSE_PROBE: usize = 4;
+/// Centroids per coarse cluster (NLIST / COARSE_CLUSTERS)
+const FINE_PER_COARSE: usize = NLIST / COARSE_CLUSTERS; // 128
+
 pub const CENTROIDS_FILE: &str = "ivf-centroids.bin";
 pub const VECTORS_FILE: &str = "ivf-vectors.bin";
 pub const LABELS_FILE: &str = "ivf-labels.bin";
@@ -30,6 +37,8 @@ pub struct IvfIndex {
     vectors: Mmap,     // [N * DIMS_PADDED] i16
     labels: Mmap,      // [N] u8
     offsets: Vec<u32>, // [NLIST + 1] cell boundaries
+    /// Coarse centroids: mean of each group of FINE_PER_COARSE centroids
+    coarse: Vec<[i32; DIMS_PADDED]>,
     total: usize,
 }
 
@@ -50,10 +59,31 @@ impl IvfIndex {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        let total = labels.len();
-        eprintln!("[ivf] loaded: {} vectors, {} cells", total, NLIST);
+        // Build coarse centroids at load time (mean of each group of 128 fine centroids)
+        let cent_slice: &[i16] = unsafe {
+            std::slice::from_raw_parts(
+                centroids.as_ptr() as *const i16,
+                centroids.len() / 2,
+            )
+        };
+        let mut coarse = vec![[0i32; DIMS_PADDED]; COARSE_CLUSTERS];
+        for g in 0..COARSE_CLUSTERS {
+            for f in 0..FINE_PER_COARSE {
+                let idx = g * FINE_PER_COARSE + f;
+                let off = idx * DIMS_PADDED;
+                for d in 0..DIMS_PADDED {
+                    coarse[g][d] += cent_slice[off + d] as i32;
+                }
+            }
+            for d in 0..DIMS_PADDED {
+                coarse[g][d] /= FINE_PER_COARSE as i32;
+            }
+        }
 
-        Ok(Self { centroids, vectors, labels, offsets, total })
+        let total = labels.len();
+        eprintln!("[ivf] loaded: {} vectors, {} cells, {} coarse clusters", total, NLIST, COARSE_CLUSTERS);
+
+        Ok(Self { centroids, vectors, labels, offsets, coarse, total })
     }
 
     pub fn is_ready(&self) -> bool {
@@ -104,42 +134,57 @@ impl IvfIndex {
     }
 
     fn closest_cells(&self, query: &[i16; DIMS_PADDED]) -> [u16; NPROBE] {
-        let centroids = self.centroids_slice();
-        let mut best0_dist = i64::MAX;
-        let mut best0_idx = 0u16;
-        let mut best1_dist = i64::MAX;
-        let mut best1_idx = 0u16;
-        let mut best2_dist = i64::MAX;
-        let mut best2_idx = 0u16;
+        // Level 1: find top COARSE_PROBE coarse clusters (64 comparisons)
+        let q32: [i32; DIMS_PADDED] = {
+            let mut out = [0i32; DIMS_PADDED];
+            for i in 0..DIMS_PADDED { out[i] = query[i] as i32; }
+            out
+        };
 
-        let mut idx = 0;
-        while idx < NLIST {
-            let offset = idx * DIMS_PADDED;
-            let c = unsafe { centroids.get_unchecked(offset..offset + DIMS_PADDED) };
-            let dist = l2_16dims(query, c);
-
-            if dist < best2_dist {
-                if dist < best0_dist {
-                    best2_dist = best1_dist;
-                    best2_idx = best1_idx;
-                    best1_dist = best0_dist;
-                    best1_idx = best0_idx;
-                    best0_dist = dist;
-                    best0_idx = idx as u16;
-                } else if dist < best1_dist {
-                    best2_dist = best1_dist;
-                    best2_idx = best1_idx;
-                    best1_dist = dist;
-                    best1_idx = idx as u16;
-                } else {
-                    best2_dist = dist;
-                    best2_idx = idx as u16;
+        let mut coarse_best = [(i64::MAX, 0u16); COARSE_PROBE];
+        for g in 0..COARSE_CLUSTERS {
+            let c = &self.coarse[g];
+            let mut dist = 0i64;
+            for d in 0..DIMS_PADDED {
+                let diff = (q32[d] - c[d]) as i64;
+                dist += diff * diff;
+            }
+            if dist < coarse_best[COARSE_PROBE - 1].0 {
+                coarse_best[COARSE_PROBE - 1] = (dist, g as u16);
+                let mut j = COARSE_PROBE - 1;
+                while j > 0 && coarse_best[j].0 < coarse_best[j - 1].0 {
+                    coarse_best.swap(j, j - 1);
+                    j -= 1;
                 }
             }
-            idx += 1;
         }
 
-        [best0_idx, best1_idx, best2_idx]
+        // Level 2: search fine centroids only within top coarse clusters
+        // COARSE_PROBE * FINE_PER_COARSE = 4 * 128 = 512 comparisons (vs 8192 before)
+        let centroids = self.centroids_slice();
+        let mut best = [(i64::MAX, 0u16); NPROBE];
+
+        for ci in 0..COARSE_PROBE {
+            let group = coarse_best[ci].1 as usize;
+            let start = group * FINE_PER_COARSE;
+            let end = start + FINE_PER_COARSE;
+            for idx in start..end {
+                let offset = idx * DIMS_PADDED;
+                let c = unsafe { centroids.get_unchecked(offset..offset + DIMS_PADDED) };
+                let dist = l2_16dims(query, c);
+
+                if dist < best[NPROBE - 1].0 {
+                    best[NPROBE - 1] = (dist, idx as u16);
+                    let mut j = NPROBE - 1;
+                    while j > 0 && best[j].0 < best[j - 1].0 {
+                        best.swap(j, j - 1);
+                        j -= 1;
+                    }
+                }
+            }
+        }
+
+        [best[0].1, best[1].1, best[2].1]
     }
 
     fn centroids_slice(&self) -> &[i16] {
