@@ -101,7 +101,7 @@ const MAX_BUF: usize = 2048;
 
 fn serve_connection(mut stream: TcpStream, state: &State) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     let mut buf = [0u8; MAX_BUF];
     let mut filled = 0;
 

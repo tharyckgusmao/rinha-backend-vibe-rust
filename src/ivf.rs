@@ -15,16 +15,16 @@ use memmap2::Mmap;
 use crate::dataset::{LoadedDataset, ReferenceLabel, VECTOR_DIMENSIONS};
 
 pub const NLIST: usize = 16384;
-pub const NPROBE: usize = 2;
+pub const NPROBE: usize = 3;
 const KMEANS_ITERS: usize = 5;
 pub const DIMS_PADDED: usize = 16;
 
-/// Number of coarse clusters (level 1)
+/// Number of coarse clusters (level 1) - UNUSED, kept for build compat
 const COARSE_CLUSTERS: usize = 64;
-/// How many coarse clusters to probe at level 1
-const COARSE_PROBE: usize = 8;
+/// How many coarse clusters to probe at level 1 - UNUSED
+const COARSE_PROBE: usize = 6;
 /// Centroids per coarse cluster (NLIST / COARSE_CLUSTERS)
-const FINE_PER_COARSE: usize = NLIST / COARSE_CLUSTERS; // 256
+const FINE_PER_COARSE: usize = NLIST / COARSE_CLUSTERS;
 
 pub const CENTROIDS_FILE: &str = "ivf-centroids.bin";
 pub const VECTORS_FILE: &str = "ivf-vectors.bin";
@@ -37,8 +37,8 @@ pub struct IvfIndex {
     vectors: Mmap,     // [N * DIMS_PADDED] i16
     labels: Mmap,      // [N] u8
     offsets: Vec<u32>, // [NLIST + 1] cell boundaries
-    /// Coarse centroids: mean of each group of FINE_PER_COARSE centroids
-    coarse: Vec<[i32; DIMS_PADDED]>,
+    /// Coarse centroids: mean of each group of FINE_PER_COARSE centroids (i16)
+    coarse: Vec<[i16; DIMS_PADDED]>,
     total: usize,
 }
 
@@ -66,24 +66,25 @@ impl IvfIndex {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        // Build coarse centroids at load time (mean of each group of 128 fine centroids)
+        // Build coarse centroids at load time (mean of each group of fine centroids)
         let cent_slice: &[i16] = unsafe {
             std::slice::from_raw_parts(
                 centroids.as_ptr() as *const i16,
                 centroids.len() / 2,
             )
         };
-        let mut coarse = vec![[0i32; DIMS_PADDED]; COARSE_CLUSTERS];
+        let mut coarse = vec![[0i16; DIMS_PADDED]; COARSE_CLUSTERS];
         for g in 0..COARSE_CLUSTERS {
+            let mut sums = [0i32; DIMS_PADDED];
             for f in 0..FINE_PER_COARSE {
                 let idx = g * FINE_PER_COARSE + f;
                 let off = idx * DIMS_PADDED;
                 for d in 0..DIMS_PADDED {
-                    coarse[g][d] += cent_slice[off + d] as i32;
+                    sums[d] += cent_slice[off + d] as i32;
                 }
             }
             for d in 0..DIMS_PADDED {
-                coarse[g][d] /= FINE_PER_COARSE as i32;
+                coarse[g][d] = (sums[d] / FINE_PER_COARSE as i32) as i16;
             }
         }
 
@@ -101,14 +102,15 @@ impl IvfIndex {
         let mut q = [0i16; DIMS_PADDED];
         q[..VECTOR_DIMENSIONS].copy_from_slice(query);
 
-        let probes = self.closest_cells(&q);
+        let probes = self.closest_cells_flat(&q);
 
-        let mut top_dists = [i64::MAX; 5];
-        let mut top_idx = [0u32; 5];
+        // Search probed cells, collect top-10 candidates for re-ranking
+        let mut top_dists = [i64::MAX; 10];
+        let mut top_idx = [0u32; 10];
         let mut top_len = 0usize;
         let vectors = self.vectors_slice();
 
-        for cell_idx in probes {
+        for &cell_idx in &probes {
             let start = self.offsets[cell_idx as usize] as usize;
             let end = self.offsets[cell_idx as usize + 1] as usize;
             for i in start..end {
@@ -116,84 +118,57 @@ impl IvfIndex {
                 let v = unsafe { vectors.get_unchecked(offset..offset + DIMS_PADDED) };
                 let dist = l2_16dims(&q, v);
 
-                if top_len < 5 {
+                if top_len < 10 {
                     top_dists[top_len] = dist;
                     top_idx[top_len] = i as u32;
                     top_len += 1;
-                    if top_len == 5 {
-                        sort5(&mut top_dists, &mut top_idx);
+                    if top_len == 10 {
+                        sort_n(&mut top_dists, &mut top_idx, 10);
                     }
-                } else if dist < top_dists[4] {
-                    top_dists[4] = dist;
-                    top_idx[4] = i as u32;
-                    sort5(&mut top_dists, &mut top_idx);
+                } else if dist < top_dists[9] {
+                    top_dists[9] = dist;
+                    top_idx[9] = i as u32;
+                    sort_n(&mut top_dists, &mut top_idx, 10);
                 }
             }
         }
 
-        // Count fraud labels — direct access to mmap'd labels
+        // Count fraud in top-5 (re-ranked from top-10)
         let labels = self.labels_slice();
         let mut fraud = 0u32;
-        for i in 0..top_len {
+        let count = if top_len < 5 { top_len } else { 5 };
+        for i in 0..count {
             fraud += unsafe { *labels.get_unchecked(top_idx[i] as usize) } as u32;
         }
         fraud as usize
     }
 
-    fn closest_cells(&self, query: &[i16; DIMS_PADDED]) -> [u16; NPROBE] {
-        // Level 1: find top COARSE_PROBE coarse clusters (128 comparisons)
-        let q32: [i32; DIMS_PADDED] = {
-            let mut out = [0i32; DIMS_PADDED];
-            for i in 0..DIMS_PADDED { out[i] = query[i] as i32; }
-            out
-        };
-
-        let mut coarse_best = [(i64::MAX, 0u8); COARSE_PROBE];
-
-        for g in 0..COARSE_CLUSTERS {
-            let c = unsafe { self.coarse.get_unchecked(g) };
-            let mut dist = 0i64;
-            for d in 0..DIMS_PADDED {
-                let diff = (q32[d] - c[d]) as i64;
-                dist += diff * diff;
-            }
-            if dist < coarse_best[COARSE_PROBE - 1].0 {
-                coarse_best[COARSE_PROBE - 1] = (dist, g as u8);
-                let mut j = COARSE_PROBE - 1;
-                while j > 0 && coarse_best[j].0 < coarse_best[j - 1].0 {
-                    coarse_best.swap(j, j - 1);
-                    j -= 1;
-                }
-            }
-        }
-
-        // Level 2: search fine centroids in top COARSE_PROBE clusters
-        // 5 * 64 = 320 fine centroid comparisons
+    /// Flat scan all centroids — no two-level approximation
+    fn closest_cells_flat(&self, query: &[i16; DIMS_PADDED]) -> [u16; NPROBE] {
         let centroids = self.centroids_slice();
         let mut best0 = (i64::MAX, 0u16);
         let mut best1 = (i64::MAX, 0u16);
+        let mut best2 = (i64::MAX, 0u16);
 
-        for ci in 0..COARSE_PROBE {
-            let group = coarse_best[ci].1 as usize;
-            let start = group * FINE_PER_COARSE;
-            let end = start + FINE_PER_COARSE;
-            for idx in start..end {
-                let offset = idx * DIMS_PADDED;
-                let c = unsafe { centroids.get_unchecked(offset..offset + DIMS_PADDED) };
-                let dist = l2_16dims(query, c);
+        for idx in 0..NLIST {
+            let offset = idx * DIMS_PADDED;
+            let c = unsafe { centroids.get_unchecked(offset..offset + DIMS_PADDED) };
+            let dist = l2_16dims(query, c);
 
-                if dist < best1.0 {
-                    if dist < best0.0 {
-                        best1 = best0;
-                        best0 = (dist, idx as u16);
-                    } else {
-                        best1 = (dist, idx as u16);
-                    }
+            if dist < best2.0 {
+                if dist < best0.0 {
+                    best2 = best1; best1 = best0;
+                    best0 = (dist, idx as u16);
+                } else if dist < best1.0 {
+                    best2 = best1;
+                    best1 = (dist, idx as u16);
+                } else {
+                    best2 = (dist, idx as u16);
                 }
             }
         }
 
-        [best0.1, best1.1]
+        [best0.1, best1.1, best2.1]
     }
 
     fn centroids_slice(&self) -> &[i16] {
@@ -219,10 +194,10 @@ impl IvfIndex {
     }
 }
 
-/// Sort 5 elements (insertion sort, optimal for tiny arrays)
+/// Sort N elements (insertion sort)
 #[inline(always)]
-fn sort5(dists: &mut [i64; 5], indices: &mut [u32; 5]) {
-    for i in 1..5 {
+fn sort_n(dists: &mut [i64], indices: &mut [u32], n: usize) {
+    for i in 1..n {
         let mut j = i;
         while j > 0 && dists[j] < dists[j - 1] {
             dists.swap(j, j - 1);
